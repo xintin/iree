@@ -12,6 +12,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingDialect.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
+#include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/Flow/Transforms/RegionOpUtils.h"
@@ -30,17 +31,23 @@ namespace mlir::iree_compiler::DispatchCreation {
 #define GEN_PASS_DEF_SETENCODINGPASS
 #include "iree/compiler/DispatchCreation/Passes.h.inc"
 
+// TODO(hanchung): Expose the control as a pass option with enum.
+static llvm::cl::opt<bool> clSetMatmulKEncoding(
+    "iree-dispatch-creation-set-mamtul-k-encoding",
+    llvm::cl::desc("Set encodings using iree_encoding.matmul_k."),
+    llvm::cl::init(false));
+
 using IREE::Encoding::EncodingAttr;
+using IREE::Encoding::MatmulKAttr;
 
 //===---------------------------------------------------------------------===//
 // Utility functions
 //===---------------------------------------------------------------------===//
 
 Value setEncoding(OpBuilder &builder, Location loc, Value source,
-                  EncodingAttr encodingAttr) {
-  auto sourceType = cast<RankedTensorType>(source.getType());
-  auto resultType = RankedTensorType::get(
-      sourceType.getShape(), sourceType.getElementType(), encodingAttr);
+                  Attribute encodingAttr) {
+  auto resultType =
+      cast<RankedTensorType>(source.getType()).cloneWithEncoding(encodingAttr);
   return builder.create<IREE::Encoding::SetEncodingOp>(loc, resultType, source);
 };
 
@@ -228,9 +235,25 @@ public:
 
     auto opType = IREE::Encoding::EncodingOpType::matmul;
     auto setEncodingWrapper = [&](Value src, int64_t operandIndex) -> Value {
-      auto encoding =
-          EncodingAttr::get(linalgOp.getContext(), operandIndex, opType,
-                            elemTypes, maps, iterationSizes);
+      MLIRContext *ctx = linalgOp.getContext();
+      Attribute encoding;
+      if (!clSetMatmulKEncoding) {
+        encoding = EncodingAttr::get(linalgOp.getContext(), operandIndex,
+                                     opType, elemTypes, maps, iterationSizes);
+      } else {
+        SmallVector<int32_t> kDims;
+        AffineMap indexingMap = maps[operandIndex];
+        auto cDims = linalg::inferContractionDims(linalgOp);
+        for (auto k : cDims->k) {
+          std::optional<unsigned> dimIdx =
+              indexingMap.getResultPosition(rewriter.getAffineDimExpr(k));
+          if (!dimIdx) {
+            continue;
+          }
+          kDims.push_back(dimIdx.value());
+        }
+        encoding = MatmulKAttr::get(ctx, kDims);
+      }
       return setEncoding(rewriter, loc, src, encoding);
     };
     Value encodedLhs = setEncodingWrapper(lhs, IREE::Encoding::MATMUL_LHS);
