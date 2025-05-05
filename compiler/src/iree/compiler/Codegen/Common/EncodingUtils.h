@@ -16,17 +16,9 @@
 
 namespace mlir::iree_compiler {
 
-using MaterializeEncodingFn =
-    std::function<FailureOr<IREE::Codegen::MaterializeEncodingInfo>(
-        RankedTensorType, IREE::HAL::ExecutableTargetAttr targetAttr)>;
-
 struct MaterializeEncodingValueInfo {
   SmallVector<Value> innerTileSizes;
 };
-
-using MaterializeEncodingValueFn =
-    std::function<FailureOr<MaterializeEncodingValueInfo>(
-        RankedTensorType, OpBuilder &, Location)>;
 
 //===---------------------------------------------------------------------===//
 // TypeConverter
@@ -37,7 +29,7 @@ class MaterializeEncodingTypeConverter : public TypeConverter {
 public:
   MaterializeEncodingTypeConverter(
       IREE::Codegen::LayoutAttrInterface layoutAttr,
-      MaterializeEncodingValueFn materializeEncodingValueFn);
+      IREE::HAL::ExecutableTargetAttr targetAttr);
 
   const IREE::Codegen::LayoutAttrInterface &getLayoutAttr() const {
     return layoutAttr;
@@ -53,7 +45,7 @@ public:
 
 private:
   const IREE::Codegen::LayoutAttrInterface layoutAttr;
-  const MaterializeEncodingValueFn materializeEncodingValueFn;
+  const IREE::HAL::ExecutableTargetAttr targetAttr;
 };
 
 /// Conversion target to use for for materializing the encoding.

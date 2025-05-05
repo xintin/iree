@@ -89,9 +89,8 @@ struct MaterializePadEncodingTypeConverter final
     : MaterializeEncodingTypeConverter {
   MaterializePadEncodingTypeConverter(
       IREE::Codegen::LayoutAttrInterface layoutAttr,
-      MaterializeEncodingValueFn materializeEncodingValueFn)
-      : MaterializeEncodingTypeConverter(layoutAttr,
-                                         materializeEncodingValueFn) {
+      IREE::HAL::ExecutableTargetAttr targetAttr)
+      : MaterializeEncodingTypeConverter(layoutAttr, targetAttr) {
     addConversion([](RankedTensorType type) -> std::optional<RankedTensorType> {
       // The type converter is designed for `pad_encoding_layout` encoding
       // attribute. By the definition, the final converted type is the same
@@ -279,12 +278,6 @@ struct MaterializeEncodingIntoPaddingPass final
     MLIRContext *context = &getContext();
     FunctionOpInterface operation = getOperation();
 
-    auto materializeEncodingValueFn =
-        [](RankedTensorType, OpBuilder &,
-           Location) -> FailureOr<MaterializeEncodingValueInfo> {
-      return failure();
-    };
-
     // Retrieve the config from executable target attribute, if any. Otherwise,
     // retrieve the config from CLI GPU target and construct a virtual
     // configuration.
@@ -321,8 +314,7 @@ struct MaterializeEncodingIntoPaddingPass final
     }
 
     RewritePatternSet materializeEncodingPattern(context);
-    MaterializePadEncodingTypeConverter typeConverter(
-        layoutAttr, materializeEncodingValueFn);
+    MaterializePadEncodingTypeConverter typeConverter(layoutAttr, targetAttr);
     MaterializeEncodingConversionTarget target(*context);
     populateMaterializeEncodingPatterns(materializeEncodingPattern, target,
                                         typeConverter);

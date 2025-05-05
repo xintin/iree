@@ -5,9 +5,11 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Common/EncodingUtils.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenTypes.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/Utils/Utils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
+#include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtTypes.h"
 #include "llvm/Support/Debug.h"
@@ -60,9 +62,8 @@ getSerializableEncodingAttr(IREE::Codegen::LayoutAttrInterface layoutAttr,
 
 MaterializeEncodingTypeConverter::MaterializeEncodingTypeConverter(
     IREE::Codegen::LayoutAttrInterface layoutAttr,
-    MaterializeEncodingValueFn materializeEncodingValueFn)
-    : layoutAttr(layoutAttr),
-      materializeEncodingValueFn(materializeEncodingValueFn) {
+    IREE::HAL::ExecutableTargetAttr targetAttr)
+    : layoutAttr(layoutAttr), targetAttr(targetAttr) {
   addConversion([](IntegerType intType) { return intType; });
   addConversion([](IndexType indexType) { return indexType; });
   addConversion([](FloatType floatType) { return floatType; });
@@ -138,6 +139,17 @@ MaterializeEncodingTypeConverter::getEncodingInfo(RankedTensorType type) const {
   return layoutAttr.getEncodingInfo(type);
 }
 
+static FailureOr<MaterializeEncodingValueInfo>
+chooseDynamicEncodingInfoVMVXMicrokernels(RankedTensorType tensorType,
+                                          OpBuilder &builder, Location loc) {
+  SmallVector<Type> resultTypes(tensorType.getRank(), builder.getIndexType());
+  auto op = builder.create<IREE::Codegen::QueryTileSizesOp>(
+      loc, resultTypes, TypeAttr::get(tensorType));
+  MaterializeEncodingValueInfo result;
+  result.innerTileSizes = op.getResults();
+  return result;
+}
+
 FailureOr<SmallVector<OpFoldResult>>
 MaterializeEncodingTypeConverter::getInnerTileSizesOfr(
     OpBuilder &rewriter, Location loc, RankedTensorType tensorType,
@@ -148,12 +160,17 @@ MaterializeEncodingTypeConverter::getInnerTileSizesOfr(
                    [](int64_t i) { return !ShapedType::isDynamic(i); })) {
     return getAsOpFoldResult(rewriter.getI64ArrayAttr(staticTileSizes));
   }
-  assert(materializeEncodingValueFn &&
-         "When dynamic tile sizes are generated, a MaterializeEncodingValueFn "
-         "should be provided.");
+  assert(
+      targetAttr &&
+      "When dynamic tile sizes are generated, a IREE::HAL::ExecutableTargetAttr"
+      "should be provided.");
 
   FailureOr<MaterializeEncodingValueInfo> materializeEncodingValueInfo =
-      materializeEncodingValueFn(tensorType, rewriter, loc);
+      failure();
+  if (isVMVXBackend(targetAttr) && hasUkernel(targetAttr)) {
+    materializeEncodingValueInfo =
+        chooseDynamicEncodingInfoVMVXMicrokernels(tensorType, rewriter, loc);
+  }
   if (failed(materializeEncodingValueInfo)) {
     return failure();
   }
