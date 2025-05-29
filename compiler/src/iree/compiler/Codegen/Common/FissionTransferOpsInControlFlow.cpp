@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -24,6 +25,15 @@ namespace mlir::iree_compiler {
 
 namespace {
 
+// Note: this should exists in mlir/lib/Dialect/IR/GPUDialect.cpp
+bool isPrivateAddressSpace(Attribute memorySpace) {
+  if (!memorySpace)
+    return false;
+  if (auto gpuAttr = llvm::dyn_cast<gpu::AddressSpaceAttr>(memorySpace))
+    return gpuAttr.getValue() == gpu::GPUDialect::getPrivateAddressSpace();
+  return false;
+}
+
 void replaceIterationVariable(Operation *op, Value iterArg, Value constant) {
   for (auto &operand : op->getOpOperands()) {
     if (operand.get() == iterArg) {
@@ -35,7 +45,7 @@ void replaceIterationVariable(Operation *op, Value iterArg, Value constant) {
 SetVector<Operation *> collectBackwardSliceInControlFlow(
     Operation *op, Operation *parentOp) {
   BackwardSliceOptions options;
-  options.inclusive = true;
+  options.inclusive = false;
   options.filter = [&](Operation *op) {
     return parentOp == op->getParentOp();
   };
@@ -44,40 +54,57 @@ SetVector<Operation *> collectBackwardSliceInControlFlow(
   return slice;
 }
 
-void splitTransferOpsFromControlFlow(PatternRewriter &rewriter,
-    vector::TransferReadOp readOp, vector::TransferWriteOp writeOp, scf::ForOp forOp) {
+void splitTransferOpsFromControlFlow(IRRewriter &rewriter,
+                                     vector::TransferReadOp readOp,
+                                     vector::TransferWriteOp writeOp,
+                                     scf::ForOp forOp) {
   rewriter.setInsertionPoint(forOp);
+  auto allocaType = cast<MemRefType>(writeOp.getBase().getType());
+  // Get rid of stride and offset information in the alloca type.
+  auto allocaTypeNoStride = MemRefType::Builder(allocaType.getShape(), allocaType.getElementType());
   auto alloca = rewriter.create<memref::AllocaOp>(  
-              //readOp.getLoc(), writeOp.getBase().getType()
-              readOp.getLoc(), cast<MemRefType>(writeOp.getBase().getType())
-      );
+              readOp.getLoc(), allocaTypeNoStride
+              );
   SetVector<Operation *> readSlice =
       collectBackwardSliceInControlFlow(readOp, forOp);
   auto readLoop = rewriter.create<scf::ForOp>(
       readOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
       forOp.getStep(), forOp.getRegionIterArgs());
-  //std::reverse(readSlice.begin(), readSlice.end());
-  //reverse the readSLice
-  SmallVector<Operation *> reversedReadSlice(readSlice.rbegin(),
-                                                  readSlice.rend());
-  // Move the readSlice into the readLoop.
-  for (Operation *op : reversedReadSlice) {
-      op->moveBefore(readLoop.getBody(), readLoop.getBody()->begin());
-  }
+  IRMapping mapping;
+  mapping.map(forOp.getInductionVar(), readLoop.getInductionVar());
+  Operation *terminator = readLoop.getBody()->getTerminator();
+
   rewriter.setInsertionPointToStart(readLoop.getBody());
-  auto newTransferWrite = writeOp.clone();      
+  for (Operation *op : readSlice) {
+    rewriter.clone(*op, mapping);
+  }
+  Operation *lastRead = rewriter.clone(*readOp, mapping);
+  //rewriter.setInsertionPoint(terminator);
+  auto newTransferWrite = writeOp.clone();
+  newTransferWrite->setOperand(0, lastRead->getResult(0));
+  // Replace the base of the transfer_write with the alloca.
   newTransferWrite->setOperand(1, alloca);
+  readLoop.getBody()->getOperations().insert(
+      terminator->getIterator(), newTransferWrite);
   //auto endOp = 
   //auto writeLoop = forOp.clone();
   rewriter.setInsertionPoint(forOp);
+  auto newReadOp = readOp.clone();
+  newReadOp->setOperand(0, alloca);
+  forOp.getBody()->getOperations().insert(
+      forOp.getBody()->begin(), newReadOp);
   for (Operation &op : forOp.getBody()->getOperations()) {
-    replaceIterationVariable(&op, readOp->getResult(0),
-                            alloca);
+    for (auto &operand : op.getOpOperands()) {
+      if (operand.get() == readOp.getResult()) {
+        operand.set(newReadOp);
+      }
+    }
   }
-  DBGS() << "Read loop: " << "\n";
-  readLoop.dump();
-  DBGS() << "Write loop: " << "\n";
-  forOp.dump();
+  rewriter.eraseOp(readOp);
+  //DBGS() << "Read loop: " << "\n";
+  //readLoop.dump();
+  //DBGS() << "Write loop: " << "\n";
+  //forOp.dump();
 
   //forOp.erase();
 }
@@ -116,9 +143,9 @@ struct FissionTarget{
   vector::TransferWriteOp writeOp;
 };
 
-static FailureOr<SmallVector<FissionTarget>> populateFissionTargets(
-    vector::TransferReadOp readOp) {
+static FailureOr<FissionTarget> processReadOp(vector::TransferReadOp readOp) {
   auto parentOp = readOp->getParentOp();
+  //auto parentOp = forOp;
   if (!parentOp || !isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parentOp)) {
     return failure();
   }
@@ -126,7 +153,7 @@ static FailureOr<SmallVector<FissionTarget>> populateFissionTargets(
   auto base = readOp.getBase();
   auto addrspace = cast<MemRefType>(base.getType()).getMemorySpace();
   if (gpu::GPUDialect::isWorkgroupMemoryAddressSpace(addrspace) ||
-      gpu::GPUDialect::isPrivateAddressSpace(addrspace)) {
+      isPrivateAddressSpace(addrspace)) {
     return failure();
   }
 
@@ -138,80 +165,91 @@ static FailureOr<SmallVector<FissionTarget>> populateFissionTargets(
   SetVector<Operation *> slice;
   getForwardSlice(readOp.getOperation(), &slice, options);
 
-  SmallVector<FissionTarget> fissionTargets;
+  bool hasWriteOp = false;
+  FissionTarget fissionTarget;
   for (Operation *op : slice) {
     if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
       auto writeBase = writeOp.getBase();
       auto writeAddrspace =
           cast<MemRefType>(writeBase.getType()).getMemorySpace();
-      if (gpu::GPUDialect::isPrivateAddressSpace(writeAddrspace)) {
+      if (isPrivateAddressSpace(writeAddrspace)) {
         // Only consider transfer_write ops that are in the same address space.
-        fissionTargets.push_back(
-            {parentOp, readOp, writeOp});
-      DBGS() << "Fissioning target readOp: " << readOp
-             << " and writeOp: " << writeOp
-             //<< " in parent operation: " << cast<scf::ForOp>(target.parent)
-             << "\n";
-
+        fissionTarget = {parentOp, readOp, writeOp};
+        hasWriteOp = true;
+        // DBGS() << "Fissioning target readOp: " << readOp
+        //        << " and writeOp: " << writeOp
+        //        //<< " in parent operation: " <<
+        //        cast<scf::ForOp>(target.parent)
+        //        << "\n";
       }
     }
   }
-  return fissionTargets;
+  if (!hasWriteOp) {
+    return failure();
+  }
+  return fissionTarget;
 }
 
+static FailureOr<SmallVector<FissionTarget>> populateFissionTargets(
+  scf::ForOp forOp) {
 
-struct FissionTransferOpsInControlFlowPattern final
-    : public OpRewritePattern<vector::TransferReadOp> {
-  using OpRewritePattern<vector::TransferReadOp>::OpRewritePattern;
-
-
-  LogicalResult matchAndRewrite(vector::TransferReadOp readOp,
-                                PatternRewriter &rewriter) const override {
-    auto FissionTargets = populateFissionTargets(readOp);
-    if (failed(FissionTargets) || FissionTargets->empty()) {
-      return failure();
+  SmallVector<FissionTarget> fissionTargets;
+  forOp->walk([&](Operation *op) {
+    if (op->getParentOp() != forOp) {
+      return;
     }
 
-    for (const FissionTarget &target : *FissionTargets) {
-      if (isa<scf::ForOp>(target.parent)) {
-        // Hoist the transfer read and dependencies in the for loop.
-        //hoistTransferReadAndDependencies(cast<scf::ForOp>(target.parent));
-        splitTransferOpsFromControlFlow(rewriter, readOp, target.writeOp,
-                                        cast<scf::ForOp>(target.parent));
-      } else {
-        return rewriter.notifyMatchFailure(
-            target.parent, "Unsupported parent operation for fission");
+    if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
+      auto result = processReadOp(readOp);
+      if (failed(result)) {
+        return;
+      }
+      fissionTargets.push_back(result.value());
+      for (const FissionTarget &target : fissionTargets) {
+        DBGS() << "Fissioning target readOp: " << target.readOp
+               << " and writeOp: "
+               << target.writeOp
+               //       << " in parent operation: " <<
+               //       cast<scf::ForOp>(target.parent)
+               << "\n";
       }
     }
-
-    return success();
-  }
-};
+  });
+  return fissionTargets;
+}
 
 struct FissionTransferOpsInControlFlowPass final
     : impl::FissionTransferOpsInControlFlowPassBase<
           FissionTransferOpsInControlFlowPass> {
 public:
-  using impl::FissionTransferOpsInControlFlowPassBase<
-      FissionTransferOpsInControlFlowPass>::FissionTransferOpsInControlFlowPassBase;
   void runOnOperation() override;
 };
 
 } // namespace
-void populateFissionTransferOpsInControlFlowPatterns(
-    RewritePatternSet &patterns) {
-  patterns.add<
-      FissionTransferOpsInControlFlowPattern>(
-      patterns.getContext());
-}
 
 void FissionTransferOpsInControlFlowPass::runOnOperation() {
-  RewritePatternSet patterns(&getContext());
-  populateFissionTransferOpsInControlFlowPatterns(
-      patterns);
-  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
-    return signalPassFailure();
+  FunctionOpInterface funcOp = getOperation();
+  IRRewriter rewriter(funcOp.getContext());
+
+  SmallVector<scf::ForOp> loops;
+  funcOp.walk([&loops](scf::ForOp forOp) { loops.push_back(forOp); });
+
+  SmallVector<FissionTarget> fissionTargets;
+  for (scf::ForOp forOp : loops) {
+    auto result = populateFissionTargets(forOp);
+    if (failed(result)) {
+      continue;
+    }
+    fissionTargets.insert(fissionTargets.end(), result.value().begin(),
+                          result.value().end());
+  }
+
+  for (const FissionTarget &target : fissionTargets) {
+    if (isa<scf::ForOp>(target.parent)) {
+      splitTransferOpsFromControlFlow(rewriter, target.readOp, target.writeOp,
+                                      cast<scf::ForOp>(target.parent));
+    }
   }
 }
-  
+
 } // namespace mlir::iree_compiler
