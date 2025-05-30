@@ -7,9 +7,10 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "mlir/Analysis/SliceAnalysis.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -42,102 +43,116 @@ void replaceIterationVariable(Operation *op, Value iterArg, Value constant) {
   }
 }
 
-SetVector<Operation *> collectBackwardSliceInControlFlow(
-    Operation *op, Operation *parentOp) {
+SetVector<Operation *> collectBackwardSliceInControlFlow(Operation *op,
+                                                         Operation *parentOp) {
   BackwardSliceOptions options;
   options.inclusive = false;
-  options.filter = [&](Operation *op) {
-    return parentOp == op->getParentOp();
-  };
+  options.filter = [&](Operation *op) { return parentOp == op->getParentOp(); };
   SetVector<Operation *> slice;
   getBackwardSlice(op, &slice, options);
   return slice;
 }
 
+void cloneSliceIntoLoop(IRRewriter &rewriter, SetVector<Operation *> &slice,
+                        scf::ForOp &newLoop, IRMapping &mapping) {
+  for (Operation *op : slice) {
+    rewriter.clone(*op, mapping);
+  }
+}
+
+scf::ForOp createNewLoop(IRRewriter &rewriter, scf::ForOp forOp, Location loc) {
+  return rewriter.create<scf::ForOp>(loc, forOp.getLowerBound(),
+                                     forOp.getUpperBound(), forOp.getStep(),
+                                     forOp.getRegionIterArgs());
+}
+
+memref::AllocaOp createAlloca(IRRewriter &rewriter,
+                              vector::TransferWriteOp writeOp) {
+  auto allocaType = cast<MemRefType>(writeOp.getBase().getType());
+  auto allocaTypeNoStride =
+      MemRefType::Builder(allocaType.getShape(), allocaType.getElementType());
+  return rewriter.create<memref::AllocaOp>(writeOp.getLoc(),
+                                           allocaTypeNoStride);
+}
+
+/// Splits transfer read and write operations from a control flow Operation
+/// (forOp) into separate loops.
+///
+/// For example, given a loop with transfer read and write operations:
+///   scf.for %i = 0 to 10 {
+///     %read = vector.transfer_read ...
+///     vector.transfer_write %read ...
+///   }
+///
+/// This function will transform it into:
+///   %alloca = memref.alloca ...  // Alloca for intermediate results
+///   scf.for %i = 0 to 10 {
+///     %read = vector.transfer_read ...
+///     vector.transfer_write %read %alloca
+///   }
+///   scf.for %j = 0 to 10 {
+///     %read = vector.transfer_read %alloca
+///     vector.transfer_write %read ...
+///   }
 void splitTransferOpsFromControlFlow(IRRewriter &rewriter,
                                      vector::TransferReadOp readOp,
                                      vector::TransferWriteOp writeOp,
                                      scf::ForOp forOp) {
+  DBGS() << "Splitting transfer ops from control flow: \n"
+         << "For Op: " << forOp << "\n";
+
   rewriter.setInsertionPoint(forOp);
-  auto allocaType = cast<MemRefType>(writeOp.getBase().getType());
-  // Get rid of stride and offset information in the alloca type.
-  auto allocaTypeNoStride = MemRefType::Builder(allocaType.getShape(), allocaType.getElementType());
-  auto alloca = rewriter.create<memref::AllocaOp>(  
-              readOp.getLoc(), allocaTypeNoStride
-              );
+  memref::AllocaOp alloca = createAlloca(rewriter, writeOp);
+
+  // Read loop
+  scf::ForOp readLoop = createNewLoop(rewriter, forOp, readOp.getLoc());
+  rewriter.setInsertionPointToStart(readLoop.getBody());
+
+  IRMapping readMapping;
+  readMapping.map(forOp.getInductionVar(), readLoop.getInductionVar());
   SetVector<Operation *> readSlice =
       collectBackwardSliceInControlFlow(readOp, forOp);
-  auto readLoop = rewriter.create<scf::ForOp>(
-      readOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
-      forOp.getStep(), forOp.getRegionIterArgs());
-  IRMapping mapping;
-  mapping.map(forOp.getInductionVar(), readLoop.getInductionVar());
-  Operation *terminator = readLoop.getBody()->getTerminator();
+  cloneSliceIntoLoop(rewriter, readSlice, readLoop, readMapping);
 
-  rewriter.setInsertionPointToStart(readLoop.getBody());
-  for (Operation *op : readSlice) {
-    rewriter.clone(*op, mapping);
-  }
-  Operation *lastRead = rewriter.clone(*readOp, mapping);
-  //rewriter.setInsertionPoint(terminator);
+  Operation *lastRead = rewriter.clone(*readOp, readMapping);
   auto newTransferWrite = writeOp.clone();
   newTransferWrite->setOperand(0, lastRead->getResult(0));
-  // Replace the base of the transfer_write with the alloca.
   newTransferWrite->setOperand(1, alloca);
-  readLoop.getBody()->getOperations().insert(
-      terminator->getIterator(), newTransferWrite);
-  //auto endOp = 
-  //auto writeLoop = forOp.clone();
-  rewriter.setInsertionPoint(forOp);
-  auto newReadOp = readOp.clone();
+  rewriter.insert(newTransferWrite);
+
+  DBGS() << "Read loop: \n" << readLoop << "\n";
+
+  // Write loop
+  rewriter.setInsertionPointAfter(readLoop.getOperation());
+  scf::ForOp writeLoop = createNewLoop(rewriter, forOp, writeOp.getLoc());
+  rewriter.setInsertionPointToStart(writeLoop.getBody());
+
+  vector::TransferReadOp newReadOp = readOp.clone();
   newReadOp->setOperand(0, alloca);
-  forOp.getBody()->getOperations().insert(
-      forOp.getBody()->begin(), newReadOp);
-  for (Operation &op : forOp.getBody()->getOperations()) {
+  rewriter.insert(newReadOp);
+
+  IRMapping writeMapping;
+  writeMapping.map(forOp.getInductionVar(), writeLoop.getInductionVar());
+  SetVector<Operation *> writeSlice =
+      collectBackwardSliceInControlFlow(writeOp, forOp);
+  cloneSliceIntoLoop(rewriter, writeSlice, writeLoop, writeMapping);
+
+  auto lastWrite = rewriter.clone(*writeOp, writeMapping);
+  lastWrite->setOperand(0, newReadOp->getResult(0));
+
+  for (Operation &op : writeLoop.getBody()->getOperations()) {
     for (auto &operand : op.getOpOperands()) {
-      if (operand.get() == readOp.getResult()) {
+      if (operand.get() == writeMapping.lookup(readOp.getResult())) {
         operand.set(newReadOp);
       }
     }
   }
-  rewriter.eraseOp(readOp);
-  //DBGS() << "Read loop: " << "\n";
-  //readLoop.dump();
-  //DBGS() << "Write loop: " << "\n";
-  //forOp.dump();
+  DBGS() << "Write loop: \n" << writeLoop << "\n";
 
-  //forOp.erase();
+  rewriter.eraseOp(forOp);
 }
 
-void hoistTransferReadAndDependencies(scf::ForOp forOp) {
-  OpBuilder builder(forOp.getContext());
-  //std::vector<Operation *> dependencies;
-  DenseSet<Operation *> visited;
-  Value iterArg = forOp.getInductionVar();
-
-  //SetVector<Operation *> slice;
-  SetVector<Operation *> dependencies;
-  BackwardSliceOptions options;
-  options.inclusive = true;
-  options.filter = [&](Operation *op) {
-    return forOp == op->getParentOp();
-  };
-  // Find transfer_read operations and relevant dependencies within the loop.
-  forOp.walk([&](vector::TransferReadOp readOp) {
-    getBackwardSlice(readOp.getOperation(), &dependencies, options);
-  });
-
-  builder.setInsertionPoint(forOp);
-  Value zero = builder.create<arith::ConstantIndexOp>(forOp.getLoc(), 0);
-
-  // Hoist dependencies in the order they were collected.
-  for (Operation *dep : dependencies) {
-    replaceIterationVariable(dep, iterArg, zero);
-    dep->moveBefore(forOp);
-  }
-}
-
-struct FissionTarget{
+struct FissionTarget {
   Operation *parent;
   vector::TransferReadOp readOp;
   vector::TransferWriteOp writeOp;
@@ -145,7 +160,7 @@ struct FissionTarget{
 
 static FailureOr<FissionTarget> processReadOp(vector::TransferReadOp readOp) {
   auto parentOp = readOp->getParentOp();
-  //auto parentOp = forOp;
+  // auto parentOp = forOp;
   if (!parentOp || !isa<scf::ForOp, scf::IfOp, scf::WhileOp>(parentOp)) {
     return failure();
   }
@@ -159,9 +174,7 @@ static FailureOr<FissionTarget> processReadOp(vector::TransferReadOp readOp) {
 
   ForwardSliceOptions options;
   options.inclusive = false;
-  options.filter = [&](Operation *op) {
-    return parentOp == op->getParentOp();
-  };
+  options.filter = [&](Operation *op) { return parentOp == op->getParentOp(); };
   SetVector<Operation *> slice;
   getForwardSlice(readOp.getOperation(), &slice, options);
 
@@ -172,7 +185,13 @@ static FailureOr<FissionTarget> processReadOp(vector::TransferReadOp readOp) {
       auto writeBase = writeOp.getBase();
       auto writeAddrspace =
           cast<MemRefType>(writeBase.getType()).getMemorySpace();
-      if (isPrivateAddressSpace(writeAddrspace)) {
+      // if (isPrivateAddressSpace(writeAddrspace)) {
+      if (isPrivateAddressSpace(writeAddrspace) ||
+          gpu::GPUDialect::isWorkgroupMemoryAddressSpace(writeAddrspace)) {
+        scf::ForOp parentForOp = cast<scf::ForOp>(parentOp);
+        if (writeOp != parentForOp.getBody()->getTerminator()->getPrevNode()) {
+          continue;
+        }
         // Only consider transfer_write ops that are in the same address space.
         fissionTarget = {parentOp, readOp, writeOp};
         hasWriteOp = true;
@@ -190,8 +209,8 @@ static FailureOr<FissionTarget> processReadOp(vector::TransferReadOp readOp) {
   return fissionTarget;
 }
 
-static FailureOr<SmallVector<FissionTarget>> populateFissionTargets(
-  scf::ForOp forOp) {
+static FailureOr<SmallVector<FissionTarget>>
+populateFissionTargets(scf::ForOp forOp) {
 
   SmallVector<FissionTarget> fissionTargets;
   forOp->walk([&](Operation *op) {
