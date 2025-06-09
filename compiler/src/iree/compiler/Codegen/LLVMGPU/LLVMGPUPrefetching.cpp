@@ -27,7 +27,13 @@ struct LLVMGPUPrefetchSharedMemoryPass final
     IRRewriter rewriter(funcOp.getContext());
 
     SmallVector<scf::ForOp> loops;
-    funcOp.walk([&loops](scf::ForOp forOp) { loops.push_back(forOp); });
+    funcOp.walk([&loops](scf::ForOp forOp) {
+      if (auto parentForOp = forOp->getParentOfType<scf::ForOp>()) {
+        // Skip nested loops for now.
+        return;
+      }
+      loops.push_back(forOp);
+    });
 
     for (scf::ForOp forOp : loops) {
       FailureOr<scf::ForOp> newLoop = prefetchSharedMemoryCopy(rewriter, forOp);

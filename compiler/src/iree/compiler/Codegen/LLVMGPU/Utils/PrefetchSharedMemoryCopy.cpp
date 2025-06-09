@@ -40,10 +40,10 @@ public:
   /// Creates an instance that plans the given scf.for |op| to be ready for
   /// prefetching. Returns failure if unable to support the given |op|.
   static FailureOr<LoopPrefetcher> get(scf::ForOp op) {
-    if (!op.getOps<scf::ForOp>().empty()) {
-      LDBG("Loop prefetcher does not support nested loops yet");
-      return failure();
-    }
+    // if (!op.getOps<scf::ForOp>().empty()) {
+    //   LDBG("Loop prefetcher does not support nested loops yet");
+    //   return failure();
+    // }
 
     LoopPrefetcher prefetcher;
     prefetcher.mapping = SmallVector<IRMapping>(4);
@@ -137,6 +137,7 @@ public:
 
 private:
   LogicalResult initializeLoopInfo() {
+    LDBG("Initializing loop info for " << forOp);
     std::optional<int64_t> lbCst = getConstantIndex(forOp.getLowerBound());
     std::optional<int64_t> ubCst = getConstantIndex(forOp.getUpperBound());
     std::optional<int64_t> stepCst = getConstantIndex(forOp.getStep());
@@ -173,21 +174,13 @@ private:
     });
   }
 
-  void getValueDependenciesForIf(scf::IfOp ifOp,
-                                 DenseSet<Operation *> &readDependencies,
-                                 DenseSet<Operation *> &writeDependencies) {
-    // scf.if with results should be supported directly through the usual
-    // handling so bail-out here in that case
-    if (ifOp->getNumResults() != 0)
-      return;
+  void getValueDependenciesNested(Operation *op,
+                                  DenseSet<Operation *> &readDependencies,
+                                  DenseSet<Operation *> &writeDependencies) {
     bool hasGlobalRead = false;
     bool hasSharedWrite = false;
     bool hasPrivateWrite = false;
-    // Else region not yet supported.
-    if (!ifOp.getElseRegion().empty()) {
-      return;
-    }
-    ifOp->walk([&](Operation *op) {
+    op->walk([&](Operation *op) {
       if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
         auto sourceType = dyn_cast<MemRefType>(readOp.getBase().getType());
         if (hasGlobalMemoryAddressSpace(sourceType)) {
@@ -214,11 +207,38 @@ private:
     // read stage and consumed  by the write stage and moving this to write
     // stage makes sure the read stage doesnt get blocked.
     if (hasGlobalRead) {
-      getValueDependencies(ifOp, readDependencies);
+      getValueDependencies(op, readDependencies);
     } else if (hasSharedWrite || hasPrivateWrite) {
-      getValueDependencies(ifOp, writeDependencies);
+      getValueDependencies(op, writeDependencies);
     }
     // Bail-out for unahndled if ops.
+  }
+
+  void getValueDependenciesForIf(scf::IfOp ifOp,
+                                 DenseSet<Operation *> &readDependencies,
+                                 DenseSet<Operation *> &writeDependencies) {
+    // scf.if with results should be supported directly through the usual
+    // handling so bail-out here in that case
+    if (ifOp->getNumResults() != 0)
+      return;
+    // Else region not yet supported.
+    if (!ifOp.getElseRegion().empty()) {
+      return;
+    }
+    getValueDependenciesNested(ifOp.getOperation(), readDependencies,
+                               writeDependencies);
+  }
+
+  void getValueDependenciesForFor(scf::ForOp forOp,
+                                  DenseSet<Operation *> &readDependencies,
+                                  DenseSet<Operation *> &writeDependencies) {
+    auto rewriter = IRRewriter(forOp.getContext());
+    rewriter.setInsertionPoint(forOp);
+    auto c8 = rewriter.create<arith::ConstantIndexOp>(forOp.getLoc(), 8);
+    forOp.setUpperBound(c8);
+
+    getValueDependenciesNested(forOp.getOperation(), readDependencies,
+                               writeDependencies);
   }
 
   // We only support loops whose bodies can be divided into 3 stages (read,
@@ -247,6 +267,8 @@ private:
         getValueDependencies(compute, computeDependencies);
       } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
         getValueDependenciesForIf(ifOp, readDependencies, writeDependencies);
+      } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+        getValueDependenciesForFor(forOp, readDependencies, writeDependencies);
       }
     }
     // If `scf.yeild` is the only compute op then there is no value in doing
