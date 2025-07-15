@@ -204,7 +204,19 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   // See https://github.com/iree-org/iree/issues/16341 for details.
   int64_t mSize = ShapedType::getNumElements(problem.mSizes);
   int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+  // K = c*y*x = 5x5x48 = 1200
+  // M = N*Ho*Wo = 16x96x64 = 98304
+  LDBG("Problem M size: " << mSize);
+  dumpVector(problem.mSizes);
+  // N = k = 48
+  LDBG("Problem N size: " << nSize);
+  dumpVector(problem.nSizes);
+
+  LDBG("mSize x nSize: " << mSize * nSize);
+  // TODO Potentially use different MMA heuristic seeds based on the problem
+  // size.
   if (mSize * nSize <= 512 * 512) {
+    LDBG("Using small MMA heuristic seeds for MxN <= 512x512");
     // For matmuls with small M*N size, we want to distribute M*N onto more
     // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
     // and a larger bestKTileCountPerSubgroup.
@@ -213,6 +225,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
              /*bestKTileCountPerSubgroup=*/8,
              /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
   } else {
+    LDBG("Using large MMA heuristic seeds for MxN > 512x512");
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
              /*bestMNTileCountPerSubgroup=*/16,
              /*bestKTileCountPerSubgroup=*/4,
@@ -226,7 +239,7 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
       problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
       transposedLhs, transposedRhs, /*canUpcastAcc=*/false,
-      /*mustBeAligned*/ mustBeAligned);
+      /*mustBeAligned*/ mustBeAligned, doCPromotion);
   return schedule;
 }
 
@@ -327,7 +340,8 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
   bool mustBeAligned = true;
   // bool doCPromotion = false;
   std::optional<GPUMMASchedule> schedule = getMmaScheduleFromProblemAndTarget(
-      target, problem, transposedLhs, transposedRhs);
+      // target, problem, transposedLhs, transposedRhs, mustBeAligned, true);
+      target, problem, transposedLhs, transposedRhs, mustBeAligned, false);
 
   // TODO (nirvedhmeshram, qedawkins): The performance with this will be bad if
   // the GEMM is accumulating (i.e doesnt have a zero fill dpsInit) as that
@@ -338,7 +352,7 @@ getMatmulLoweringConfigAndWorkgroupSize(SmallVector<int64_t> bounds,
     mustBeAligned = false;
     // doCPromotion = true;
     schedule = getMmaScheduleFromProblemAndTarget(
-        target, problem, transposedLhs, transposedRhs, mustBeAligned);
+        target, problem, transposedLhs, transposedRhs, mustBeAligned, true);
   }
 
   if (!schedule) {
