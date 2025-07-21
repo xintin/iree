@@ -204,20 +204,32 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   // See https://github.com/iree-org/iree/issues/16341 for details.
   int64_t mSize = ShapedType::getNumElements(problem.mSizes);
   int64_t nSize = ShapedType::getNumElements(problem.nSizes);
-  if (mSize * nSize <= 512 * 512) {
+  int64_t kSize = ShapedType::getNumElements(problem.kSizes);
+  int64_t computeIntensity = (2 * mSize * nSize * kSize) / (mSize * nSize + nSize * kSize + 
+                                                               mSize * kSize);
+
+  //if (mSize * nSize <= 512 * 512) {
+  // Small GEMM
+  if (computeIntensity <= 10) {
     // For matmuls with small M*N size, we want to distribute M*N onto more
     // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
     // and a larger bestKTileCountPerSubgroup.
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
-             /*bestMNTileCountPerSubgroup=*/4,
-             /*bestKTileCountPerSubgroup=*/8,
+             /*bestMNTileCountPerSubgroup=*/1,
+             /*bestKTileCountPerSubgroup=*/4,
              /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
-  } else {
+  // Large GEMM
+  } else if (computeIntensity >= 800) {
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
              /*bestMNTileCountPerSubgroup=*/16,
              /*bestKTileCountPerSubgroup=*/4,
              /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / 2 /
                  inBitWidth};
+  } else {
+    seeds = {/*bestSubgroupCountPerWorkgroup=*/8,
+             /*bestMNTileCountPerSubgroup=*/8,
+             /*bestKTileCountPerSubgroup=*/8,
+             /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
   }
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();

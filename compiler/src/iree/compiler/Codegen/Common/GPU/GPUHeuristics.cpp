@@ -301,6 +301,13 @@ getBestKTileSizes(const GPUMatmulShapeType &problem,
   while (kDim >= 0) {
     APInt kGCD = GreatestCommonDivisor(APInt(64, kTotalTileCounts[kDim]),
                                        APInt(64, bestKTileCountPerSubgroup));
+
+    if ((kGCD == 1) && (kTotalTileCounts[kDim] < bestKTileCountPerSubgroup)) {
+      // If the GCD is 1, it means we cannot tile this dimension to satisfy the
+      // ideal K intrinsic count per subgroup. We can only tile it to 1.
+      kGCD = kTotalTileCounts[kDim];
+    }    
+
     kTileSizes[kDim] = kGCD.getSExtValue();
     bestKTileCountPerSubgroup /= kTileSizes[kDim];
     --kDim;
