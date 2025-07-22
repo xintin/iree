@@ -5,9 +5,20 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
+#include "llvm/Support/Debug.h"
 #include "mlir/IR/Types.h"
 
 namespace mlir::iree_compiler {
+
+auto dumpVector = [](const SmallVector<int64_t, 2> &vector) {
+  for (size_t i = 0; i < vector.size(); ++i) {
+    llvm::dbgs() << vector[i];
+    if (i < vector.size() - 1) {
+      llvm::dbgs() << ", ";
+    }
+  }
+  llvm::dbgs() << "\n";
+};
 
 /// Struct containing information about a matmul's shape and type.
 struct GPUMatmulShapeType {
