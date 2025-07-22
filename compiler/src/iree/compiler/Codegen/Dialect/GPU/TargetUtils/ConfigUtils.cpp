@@ -221,8 +221,8 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   // Large GEMM
   } else if (computeIntensity >= 800) {
     seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
-             /*bestMNTileCountPerSubgroup=*/16,
-             /*bestKTileCountPerSubgroup=*/4,
+             /*bestMNTileCountPerSubgroup=*/8,
+             /*bestKTileCountPerSubgroup=*/8,
              /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / 2 /
                  inBitWidth};
   } else {

@@ -57,6 +57,8 @@ static int64_t calculateOperandsSharedMemoryUsedInBytes(
   int64_t tileN = schedule.nSize * prod(schedule.nTileSizes) *
                   prod(schedule.nSubgroupCounts);
   int64_t tileK = schedule.kSize * prod(schedule.kTileSizes);
+  llvm::errs() << "tileM: " << tileM << ", tileN: " << tileN
+               << ", tileK: " << tileK << "\n";
   return (tileM * tileK * lhsBitwidth + tileN * tileK * rhsBitwidth) / 8;
 }
 
@@ -354,6 +356,18 @@ static GPUMMASchedule getOptimalMMASchedule(const GPUMatmulShapeType &problem,
     int64_t subgroupSqrt =
         1ull << (llvm::divideCeil(llvm::Log2_64(remainingSubgroups), 2));
     int64_t tileSqrt = 1ull << (llvm::Log2_64(remainingTiles) / 2);
+    // debug print on mDim and nDim
+    LLVM_DEBUG({
+      llvm::dbgs() << "mDim: " << mDim << ", nDim: " << nDim
+                   << ", remainingSubgroups: " << remainingSubgroups
+                   << ", remainingTiles: " << remainingTiles
+                   << ", subgroupSqrt: " << subgroupSqrt
+                   << ", tileSqrt: " << tileSqrt << "\n";
+    });
+    LLVM_DEBUG({
+      llvm::dbgs() << "mTotalTileCounts: " << mTotalTileCounts << "\n";
+      llvm::dbgs() << "nTotalTileCounts: " << nTotalTileCounts << "\n";
+    });
 
     // See if the square root can divide mTotalTileCount. If so it means we can
     // distribute to both dimensions evenly to minimize the number of global
@@ -433,6 +447,7 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
     LLVM_DEBUG({
       llvm::dbgs() << "chosen MMA schedule:\n";
       llvm::dbgs() << "  " << schedule << "\n";
+      llvm::dbgs() << " do cpromotion: " << doCPromotion << "\n";
     });
 
     auto isValidSchedule = [&](const GPUMMASchedule &schedule) -> bool {
