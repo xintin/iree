@@ -977,14 +977,16 @@ setConvolutionVectorDistributionConfig(IREE::GPU::TargetAttr target,
                              /*bestKTileCountPerSubgroup=*/2};
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
+  auto chip = target.getChip();
+  int64_t cuCount = chip ? chip.getWgpCount() : 304;
 
   // First try to find a schedule with an exactly matching intrinsic.
   FailureOr<GPUMMASchedule> schedule = deduceMMASchedule(
-      problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize);
+      problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize, cuCount);
   if (failed(schedule)) {
     // Then try again by allowing upcasting accumulator.
     schedule = deduceMMASchedule(
-        problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
+        problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize, cuCount,
         /*transposedLhs*/ false, /*transposedRhs*/ false,
         /*canUpcastAcc=*/true);
   }
@@ -1209,6 +1211,8 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
   seeds.bestMNTileCountPerSubgroup /= op.getNumDpsInputs() - 1;
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
+  auto chip = target.getChip();
+  int64_t cuCount = chip ? chip.getWgpCount() : 304;
 
   LDBG("Matmul Vector Distribution Config");
 
@@ -1225,12 +1229,12 @@ setMatmulVectorDistributionConfig(IREE::GPU::TargetAttr target,
 
   // First try to find a schedule with an exactly matching intrinsic.
   std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
-      problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize);
+      problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize, cuCount);
   if (!schedule) {
     // Then try again by allowing upcasting accumulator.
     schedule =
         deduceMMASchedule(problem, intrinsics, seeds, maxSharedMemoryBytes,
-                          targetSubgroupSize, transposedLhs, transposedRhs,
+                          targetSubgroupSize, cuCount, transposedLhs, transposedRhs,
                           /*canUpcastAcc=*/true);
   }
 

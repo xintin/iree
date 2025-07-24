@@ -16,6 +16,8 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUOps.h"
 #include "iree/compiler/Codegen/Interfaces/PartitionableLoopsInterface.h"
+#include "iree/compiler/Codegen/Dialect/GPU/TargetUtils/KnownTargets.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -205,56 +207,57 @@ static std::optional<GPUMMASchedule> getMmaScheduleFromProblemAndTarget(
   int64_t mSize = ShapedType::getNumElements(problem.mSizes);
   int64_t nSize = ShapedType::getNumElements(problem.nSizes);
 
-  // if (mSize * nSize <= 512 * 512) {
-  //   // For matmuls with small M*N size, we want to distribute M*N onto more
-  //   // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
-  //   // and a larger bestKTileCountPerSubgroup.
-  //   seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
-  //            /*bestMNTileCountPerSubgroup=*/4,
-  //            /*bestKTileCountPerSubgroup=*/8,
-  //            /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits /
-  //            inBitWidth};
-  // } else {
-  //   seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
-  //            /*bestMNTileCountPerSubgroup=*/16,
-  //            /*bestKTileCountPerSubgroup=*/4,
-  //            /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / 2 /
-  //                inBitWidth};
-  // }
-
-  int64_t kSize = ShapedType::getNumElements(problem.kSizes);
-  int64_t computeIntensity = (2 * mSize * nSize * kSize) / (mSize * nSize + nSize * kSize + 
-                                                               mSize * kSize);
-
-  //if (mSize * nSize <= 512 * 512) {
-  // Small GEMM
-  if (computeIntensity <= 10) {
+  if (mSize * nSize <= 512 * 512) {
     // For matmuls with small M*N size, we want to distribute M*N onto more
     // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
     // and a larger bestKTileCountPerSubgroup.
-    seeds = {/*bestSubgroupCountPerWorkgroup=*/2,
-             /*bestMNTileCountPerSubgroup=*/2,
+    seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
+             /*bestMNTileCountPerSubgroup=*/4,
+             /*bestKTileCountPerSubgroup=*/8,
+             /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits /
+             inBitWidth};
+  } else {
+    seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
+             /*bestMNTileCountPerSubgroup=*/16,
              /*bestKTileCountPerSubgroup=*/4,
-             /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
-    // Large GEMM
-  } else if (computeIntensity >= 1000) {
-    seeds = {/*bestSubgroupCountPerWorkgroup=*/8,
-             /*bestMNTileCountPerSubgroup=*/8,
-             /*bestKTileCountPerSubgroup=*/2,
              /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / 2 /
                  inBitWidth};
-  } else {
-    seeds = {/*bestSubgroupCountPerWorkgroup=*/8,
-             /*bestMNTileCountPerSubgroup=*/4,
-             /*bestKTileCountPerSubgroup=*/4,
-             /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
   }
 
+
+   //Small GEMM
+  //if (computeIntensity <= 10) {
+  //  // For matmuls with small M*N size, we want to distribute M*N onto more
+  //  // workgroups to fill the GPU. Use a smaller bestMNTileCountPerSubgroup
+  //  // and a larger bestKTileCountPerSubgroup.
+  //  seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
+  //           /*bestMNTileCountPerSubgroup=*/1,
+  //           /*bestKTileCountPerSubgroup=*/4,
+  //           /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
+  //  // Large GEMM
+  //} else if (computeIntensity >= 1000) {
+  //  seeds = {/*bestSubgroupCountPerWorkgroup=*/4,
+  //           /*bestMNTileCountPerSubgroup=*/16,
+  //           /*bestKTileCountPerSubgroup=*/4,
+  //           /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / 2 /
+  //               inBitWidth};
+  //} else {
+  //  seeds = {/*bestSubgroupCountPerWorkgroup=*/8,
+  //           /*bestMNTileCountPerSubgroup=*/8,
+  //           /*bestKTileCountPerSubgroup=*/8,
+  //           /*bestKElementCountPerSubgroup*/ kCacheLineSizeBits / inBitWidth};
+  //}
+
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
+  // crash: int cuCount = target.getChip().getWgpCount();
+  auto chip = target.getChip();
+  int64_t cuCount = chip ? chip.getWgpCount() : 304;
+  llvm::errs() << "Using " << cuCount
+             << " compute units for MMA schedule inference.\n";
 
   // First try to find a schedule with an exactly matching intrinsic.
   std::optional<GPUMMASchedule> schedule = deduceMMASchedule(
-      problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize,
+      problem, intrinsics, seeds, maxSharedMemoryBytes, targetSubgroupSize, cuCount,
       transposedLhs, transposedRhs, /*canUpcastAcc=*/false,
       /*mustBeAligned*/ mustBeAligned, doCPromotion);
   return schedule;

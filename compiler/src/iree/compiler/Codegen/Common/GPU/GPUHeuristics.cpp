@@ -436,7 +436,7 @@ static GPUMMASchedule getOptimalMMASchedule(const GPUMatmulShapeType &problem,
 FailureOr<GPUMMASchedule> deduceMMASchedule(
     const GPUMatmulShapeType &problem, ArrayRef<GPUIntrinsicType> intrinsics,
     const GPUMMAHeuristicSeeds &seeds, int64_t sharedMemLimitInBytes,
-    int64_t subgroupSize, bool transposedLhs, bool transposedRhs,
+    int64_t subgroupSize, int64_t cuCount, bool transposedLhs, bool transposedRhs,
     bool canUpcastAcc, bool mustBeAligned, bool doCPromotion) {
   for (const GPUIntrinsicType &intrinsic : intrinsics) {
     if (failed(canTargetIntrinsic(problem, intrinsic, subgroupSize,
@@ -444,7 +444,42 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
       continue;
     }
 
-    GPUMMASchedule schedule = getOptimalMMASchedule(problem, intrinsic, seeds);
+    int64_t mSize = ShapedType::getNumElements(problem.mSizes);
+    int64_t nSize = ShapedType::getNumElements(problem.nSizes);
+    int64_t kSize = ShapedType::getNumElements(problem.kSizes);
+    int64_t arithmeticIntensity = (2 * mSize * nSize * kSize) /
+                               (mSize * nSize + nSize * kSize + mSize * kSize);
+    GPUMMAHeuristicSeeds localSeeds = seeds;
+    if (arithmeticIntensity > 10) {
+      auto computeWorkgroupCount = [&](){
+        // Compute the number of workgroups needed to cover the problem size.
+        int64_t mnTileSizePerSubgroup = localSeeds.bestMNTileCountPerSubgroup *
+                                        intrinsic.mSizes[0] * intrinsic.nSizes[0];
+        int64_t workgroupSize = mnTileSizePerSubgroup *
+                                localSeeds.bestSubgroupCountPerWorkgroup;
+        return mSize * nSize / workgroupSize;
+      };
+      int64_t numWorkgroups = computeWorkgroupCount();
+      llvm::errs() << "Initial number of workgroups: " << numWorkgroups << "\n";
+
+      while(numWorkgroups< cuCount){
+        // If the number of workgroups is less than the number of compute units,
+        // we can increase the tile size to fill the GPU.
+        if (localSeeds.bestMNTileCountPerSubgroup <= 1) {
+          llvm::errs() << "Cannot decrease tile size further, "
+                       << "bestMNTileCountPerSubgroup is already 1.\n";
+          break;
+        }
+        int64_t oldTileSize = localSeeds.bestMNTileCountPerSubgroup;
+        localSeeds.bestMNTileCountPerSubgroup /= 2;
+        llvm::errs() << "decreasing bestMNTileCountPerSubgroup from "
+                     << oldTileSize << " to "
+                     << localSeeds.bestMNTileCountPerSubgroup << "\n";
+        numWorkgroups = computeWorkgroupCount();
+      }
+    }
+
+    GPUMMASchedule schedule = getOptimalMMASchedule(problem, intrinsic, localSeeds);
 
     LLVM_DEBUG({
       llvm::dbgs() << "chosen MMA schedule:\n";
