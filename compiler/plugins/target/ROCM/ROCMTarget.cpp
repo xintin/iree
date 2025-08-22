@@ -826,7 +826,7 @@ protected:
       ArrayRef<IREE::HAL::ExecutableExportOp> exportOps,
       StringRef hsacoModule) {
     iree_compiler::FlatbufferBuilder builder;
-    iree_hal_amdgpu_ExecutableDef_start_as_root(builder);
+    iree_hal_amdgpu_ExecutableDef_start_as_root_with_size(builder);
 
     // Attach embedded source file contents.
     auto sourceFilesRef = createSourceFilesVec(
@@ -912,7 +912,7 @@ protected:
                               ArrayRef<IREE::HAL::ExecutableExportOp> exportOps,
                               StringRef hsacoModule) {
     iree_compiler::FlatbufferBuilder builder;
-    iree_hal_hip_ExecutableDef_start_as_root(builder);
+    iree_hal_hip_ExecutableDef_start_as_root_with_size(builder);
 
     // Attach embedded source file contents.
     auto sourceFilesRef = createSourceFilesVec(
