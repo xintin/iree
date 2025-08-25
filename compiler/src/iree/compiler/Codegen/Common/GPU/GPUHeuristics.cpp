@@ -311,12 +311,174 @@ getBestKTileSizes(const GPUMatmulShapeType &problem,
   return kTileSizes;
 }
 
-/// Choose an optimal mma schedule with the heuristic that minimized the total
-/// amount of data read from global memory, per workgroup, respecting the
-/// heuristic seeds.
+static int64_t distributeTilesUsingGCD(int64_t &totalTiles,
+                                       int64_t &tilesToDistribute) {
+  APInt gcd = GreatestCommonDivisor(APInt(64, tilesToDistribute),
+                                    APInt(64, totalTiles));
+  int64_t distributeTileCount = gcd.getSExtValue();
+  totalTiles /= distributeTileCount;
+  tilesToDistribute /= distributeTileCount;
+
+  return distributeTileCount;
+}
+
+static void
+distributeSqrtForDim(bool isMDim, int64_t subgroupSqrt, int64_t tileSqrt,
+                     int64_t &mCollapsedSubgroupCount,
+                     int64_t &nCollapsedSubgroupCount,
+                     int64_t &mCollapsedTileSize, int64_t &nCollapsedTileSize,
+                     int64_t &remainingSubgroups, int64_t &remainingTiles) {
+  if (isMDim) {
+    mCollapsedSubgroupCount = subgroupSqrt;
+    mCollapsedTileSize = tileSqrt;
+  } else {
+    nCollapsedSubgroupCount = subgroupSqrt;
+    nCollapsedTileSize = tileSqrt;
+  }
+  // consume seeds
+  remainingSubgroups /= subgroupSqrt;
+  remainingTiles /= tileSqrt;
+}
+
+static void
+distributeGCDForDim(bool isMDim, int64_t &mCollapsedCount,
+                    int64_t &nCollapsedCount, int64_t &mCollapsedSubgroupCount,
+                    int64_t &nCollapsedSubgroupCount,
+                    int64_t &mCollapsedTileSize, int64_t &nCollapsedTileSize,
+                    int64_t &remainingSubgroups, int64_t &remainingTiles) {
+
+  int64_t &count = isMDim ? mCollapsedCount : nCollapsedCount;
+  int64_t &sub = isMDim ? mCollapsedSubgroupCount : nCollapsedSubgroupCount;
+  int64_t &tile = isMDim ? mCollapsedTileSize : nCollapsedTileSize;
+
+  sub = distributeTilesUsingGCD(count, remainingSubgroups);
+  tile = distributeTilesUsingGCD(count, remainingTiles);
+}
+
 static GPUMMASchedule getOptimalMMASchedule(const GPUMatmulShapeType &problem,
                                             const GPUIntrinsicType &intrinsic,
                                             const GPUMMAHeuristicSeeds &seeds) {
+  assert(intrinsic.mSizes.size() == 1 && intrinsic.nSizes.size() == 1 &&
+         intrinsic.kSizes.size() <= 2 &&
+         "expected intrinsic to have a single M, N, and K <= 2 dimensions.");
+  // mTotalTileCounts and nTotalTileCounts represent the total number of
+  // intrinsics along the M or N dimensions needed to fill the problem size.
+  // For example, if the problem is {M:[4, 16], N:[2, 32], K[3, 128]} for a
+  // 16x16x16 intrinsic, then:
+  //  - mTotalTileCounts would be 4 * (16/16) = 4
+  //  - nTotalTileCounts would be 2 * (32/16) = 4
+  SmallVector<int64_t, 2> mTotalTileCounts = problem.mSizes;
+  SmallVector<int64_t, 2> nTotalTileCounts = problem.nSizes;
+  LDBG() << "mTotalTileCounts: " << mTotalTileCounts
+         << ", nTotalTileCounts: " << nTotalTileCounts;
+  mTotalTileCounts.back() =
+      llvm::divideCeil(problem.mSizes.back(), intrinsic.mSizes[0]);
+  nTotalTileCounts.back() =
+      llvm::divideCeil(problem.nSizes.back(), intrinsic.nSizes[0]);
+
+  int64_t mCollapsedCount = prod(mTotalTileCounts);
+  int64_t nCollapsedCount = prod(nTotalTileCounts);
+
+  // Assign more subgroups to the M dimension (used later) to balance thread
+  // counts along X and Y dimensions.
+  int64_t remainingSubgroups = seeds.bestSubgroupCountPerWorkgroup;
+  int64_t remainingTiles = seeds.bestMNTileCountPerSubgroup;
+
+  // Initial collapsed subgroup counts and tile sizes. Always distribute
+  // to collapsed M and N dimensions to avoid starving either dimension.
+  int64_t mCollapsedSubgroupCount = 1;
+  int64_t nCollapsedSubgroupCount = 1;
+  int64_t mCollapsedTileSize = 1;
+  int64_t nCollapsedTileSize = 1;
+
+  LDBG() << "Starting MMA schedule distribution";
+  LDBG() << "mTotalTileCounts: " << mTotalTileCounts
+         << ", nTotalTileCounts: " << nTotalTileCounts
+         << ", remainingSubgroups: " << remainingSubgroups
+         << ", remainingTiles: " << remainingTiles;
+
+  int64_t subgroupSqrt =
+      1ull << (llvm::divideCeil(llvm::Log2_64(remainingSubgroups), 2));
+  int64_t tileSqrt = 1ull << (llvm::Log2_64(remainingTiles) / 2);
+  int64_t splitFactor = subgroupSqrt * tileSqrt;
+
+  LDBG() << "splitFactor: " << splitFactor << ", subgroupSqrt: " << subgroupSqrt
+         << ", tileSqrt: " << tileSqrt;
+
+  // See if the square root can divide total tile count. If so it means we can
+  // distribute to a dimensions evenly to minimize the number of global
+  // loads. Or else fall back to GCD distribution.
+  bool canMDistributeEvenly =
+      mCollapsedCount > splitFactor && mCollapsedCount % splitFactor == 0;
+  if (canMDistributeEvenly) {
+    distributeSqrtForDim(true, subgroupSqrt, tileSqrt, mCollapsedSubgroupCount,
+                         nCollapsedSubgroupCount, mCollapsedTileSize,
+                         nCollapsedTileSize, remainingSubgroups,
+                         remainingTiles);
+    distributeGCDForDim(false, mCollapsedCount, nCollapsedCount,
+                        mCollapsedSubgroupCount, nCollapsedSubgroupCount,
+                        mCollapsedTileSize, nCollapsedTileSize,
+                        remainingSubgroups, remainingTiles);
+  } else {
+    distributeGCDForDim(false, mCollapsedCount, nCollapsedCount,
+                        mCollapsedSubgroupCount, nCollapsedSubgroupCount,
+                        mCollapsedTileSize, nCollapsedTileSize,
+                        remainingSubgroups, remainingTiles);
+    distributeGCDForDim(true, mCollapsedCount, nCollapsedCount,
+                        mCollapsedSubgroupCount, nCollapsedSubgroupCount,
+                        mCollapsedTileSize, nCollapsedTileSize,
+                        remainingSubgroups, remainingTiles);
+  }
+
+  // Note: Experimentation has proved that leaving the leftover factors
+  // unassigned is better than greedily assigning them to the larger collapsed
+  // dimension. This is likely because assigning leftover factors often results
+  // in overly aggressive tiling that ended up reducing occupancy and
+  // increasing shared memory usage.
+  LDBG() << "Leftover factors: subgroups: " << remainingSubgroups
+         << ", tiles: " << remainingTiles;
+  LDBG() << "Collapsed subgroup counts: M: " << mCollapsedSubgroupCount
+         << ", N: " << nCollapsedSubgroupCount;
+  LDBG() << "Collapsed tile sizes: M: " << mCollapsedTileSize
+         << ", N: " << nCollapsedTileSize;
+
+  SmallVector<int64_t> mSubgroupCounts(problem.mSizes.size(), 0),
+      nSubgroupCounts(problem.nSizes.size(), 0),
+      mTileSizes(problem.mSizes.size(), 0),
+      nTileSizes(problem.nSizes.size(), 0);
+
+  // Distribute to M dims from inner -> outer
+  for (int i = problem.mSizes.size() - 1; i >= 0; --i) {
+    mSubgroupCounts[i] =
+        distributeTilesUsingGCD(mTotalTileCounts[i], mCollapsedSubgroupCount);
+    mTileSizes[i] =
+        distributeTilesUsingGCD(mTotalTileCounts[i], mCollapsedTileSize);
+  }
+
+  // Distribute to N dims from inner -> outer
+  for (int i = problem.nSizes.size() - 1; i >= 0; --i) {
+    nSubgroupCounts[i] =
+        distributeTilesUsingGCD(nTotalTileCounts[i], nCollapsedSubgroupCount);
+    nTileSizes[i] =
+        distributeTilesUsingGCD(nTotalTileCounts[i], nCollapsedTileSize);
+  }
+
+  SmallVector<int64_t> kTileSizes =
+      getBestKTileSizes(problem, intrinsic, seeds);
+
+  return GPUMMASchedule{
+      intrinsic.mmaKind,   intrinsic.mSizes[0], intrinsic.nSizes[0],
+      intrinsic.kSizes[0], mSubgroupCounts,     nSubgroupCounts,
+      mTileSizes,          nTileSizes,          kTileSizes};
+}
+
+/// Choose an optimal mma schedule with the heuristic that minimized the total
+/// amount of data read from global memory, per workgroup, respecting the
+/// heuristic seeds.
+static GPUMMASchedule
+getOptimalMMAScheduleOld(const GPUMatmulShapeType &problem,
+                         const GPUIntrinsicType &intrinsic,
+                         const GPUMMAHeuristicSeeds &seeds) {
   assert(intrinsic.mSizes.size() == 1 && intrinsic.nSizes.size() == 1 &&
          intrinsic.kSizes.size() <= 2 &&
          "expected intrinsic to have a single M, N, and K <= 2 dimensions.");
